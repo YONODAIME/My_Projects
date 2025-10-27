@@ -1,0 +1,199 @@
+import pymysql
+import settings
+import pandas as pd
+
+
+# Подключение к базе данных для получения данных
+def get_summary(request):
+    try:
+        conn = pymysql.connect(
+            host=settings.SERVER_SUMMARY,
+            user=settings.USER_SUMMARY,
+            password=settings.PASSWORD_SUMMARY,
+            database=settings.DATABASE_RAW
+        )
+        cursor = conn.cursor()
+        cursor.execute(request)
+    except pymysql.Error as error:
+        print(error)
+    else:
+        response = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return response
+    finally:
+        pass
+
+
+def get_mart(request):
+    try:
+        conn = pymysql.connect(
+            host=settings.HOST_SUPERSET,
+            user=settings.USER_SUPERSET,
+            password=settings.PASSWORD_SUPERSET,
+            database=settings.DATABASE_SUPERSET_MART
+        )
+        cursor = conn.cursor()
+        cursor.execute(request)
+    except pymysql.Error as error:
+        print(error)
+    else:
+        response = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return response
+    finally:
+        pass
+
+
+# Получение максимального месяца в таблице credit_subscribe
+def extract_max_month():
+    request = """
+    select max(year_month_key)
+    from debt_subscribe;
+    """
+    try:
+        result = get_mart(request)
+        # Проверяем, что результат не пустой и содержит данные
+        if result and result[0] and result[0][0]:
+            max_month = result[0][0]
+        else:
+            max_month = "202401"
+    except Exception as e:
+        # Логируем ошибку, если необходимо
+        print(f"Ошибка при выполнении запроса: {e}")
+        max_month = "202401"
+
+    return max_month
+
+
+# Собираем данные
+def create_dataset(max_month):
+    request = f"""
+      SELECT 
+    name,
+    year_month_key,
+    month_name,
+    currency,
+    client_type,
+    SUM(price) AS total_price
+FROM (
+    WITH filtered_data AS (
+        SELECT
+            b.order_id,
+            b.quantity,
+            b.price,
+            b.name,
+            utsi.UF_CRM_1487336268 AS currency,
+            i.date_insert,
+            i.date_payed,
+            i.date_canceled,
+            i.status_id,
+            company.ID,
+            CASE 
+                WHEN company.ID IN (SELECT ID FROM summary_data.big_client)
+                THEN 'КК' 
+                ELSE 'Не КК' 
+            END AS client_type
+        FROM raw_data.b_crm_invoice_basket AS b
+        LEFT JOIN raw_data.b_crm_invoice AS i 
+            ON i.id = b.order_id
+        LEFT JOIN raw_data.b_uts_crm_invoice AS utsi 
+            ON utsi.value_id = i.id
+        LEFT JOIN raw_data.b_crm_company AS company 
+            ON utsi.UF_COMPANY_ID = company.ID
+        WHERE
+            (b.name LIKE '%абонентск%'
+             OR b.name LIKE '%подписк%сервис%'
+             OR b.name LIKE '%лицензия%zavgar%'
+             OR b.name LIKE '%Доступ%сервер%' 
+             OR b.NAME LIKE '%wiafleet%')
+    ),
+    data_with_months AS (
+        SELECT
+            name,
+            ym1.year_month_key,
+            ym1.month_name,
+            f.currency,
+            f.client_type,
+            ROUND(SUM(f.quantity * f.price), 2) AS sum_rub
+        FROM filtered_data AS f
+        CROSS JOIN (
+            SELECT
+                year_month_key,
+                REPLACE(year_month_name, ' ', '%') AS month_name,
+                STR_TO_DATE(CONCAT(year_month_key, '01'), '%Y%m%d') AS month_start
+            FROM meta_data.dict_year_month
+            WHERE
+                year_month_key > {max_month}  -- >= EXTRACT(YEAR_MONTH FROM (curdate() - INTERVAL 12 MONTH))
+                AND year_month_key <= EXTRACT(YEAR_MONTH FROM curdate())
+        ) AS ym1
+        RIGHT JOIN (
+            SELECT
+                year_month_key as year_month_key2,
+                REPLACE(year_month_name, ' ', '%') AS month_name2
+            FROM meta_data.dict_year_month
+            WHERE year_month_key >= EXTRACT(YEAR_MONTH FROM (curdate() - INTERVAL 36 MONTH))
+              AND year_month_key < EXTRACT(YEAR_MONTH FROM (curdate()))
+        ) AS ym2 
+            ON f.name LIKE CONCAT('%', ym2.month_name2, '%')
+        WHERE
+            f.date_insert < ym1.month_start
+            AND (
+                (
+                    (f.date_payed > ym1.month_start OR f.date_payed IS NULL)
+                    AND status_id != 'D'
+                )
+                OR (f.date_canceled > ym1.month_start AND status_id = 'D')
+            )
+            AND (
+                (
+                    (ym2.year_month_key2 < EXTRACT(YEAR_MONTH FROM f.date_payed) OR f.date_payed IS NULL)
+                    AND status_id != 'D'
+                )
+                OR (ym2.year_month_key2 < EXTRACT(YEAR_MONTH FROM f.date_canceled) AND status_id = 'D')
+            )
+            AND ym1.year_month_key > ym2.year_month_key2
+        GROUP BY name, ym1.year_month_key, f.currency, f.client_type
+    )
+    SELECT
+        CASE 
+            WHEN name LIKE 'Абонентское обслуживание%' THEN SUBSTRING_INDEX(name, ' ', 4)
+            WHEN name LIKE 'Абонентское техническое%' THEN SUBSTRING_INDEX(name, ' ', 5)
+            WHEN name LIKE 'Абонентская%' THEN SUBSTRING_INDEX(name, ' ', 4)
+            WHEN name LIKE 'Лицензия%' THEN SUBSTRING_INDEX(name, ' ', 5)
+            WHEN name LIKE 'Подписка на сервис по видео%' THEN SUBSTRING_INDEX(name, ' ', 5)
+            WHEN name LIKE 'Подписка на сервис по%' THEN SUBSTRING_INDEX(name, ' ', 7)
+            WHEN name LIKE 'Подписка на сервис удаленного%' THEN SUBSTRING_INDEX(name, ' ', 5) 
+            ELSE name 
+        END AS name,
+        year_month_key,
+        month_name,
+        currency,
+        client_type,
+        CAST(ROUND(sum_rub, 2) AS UNSIGNED) price
+    FROM data_with_months
+    GROUP BY name, year_month_key, month_name, currency, client_type
+    ORDER BY year_month_key
+) correct
+GROUP BY name, year_month_key, currency, client_type;
+        """
+    columns = ['name', 'year_month_key', 'month_name', 'currency', 'total_sum']
+
+    df = pd.DataFrame(get_summary(request), columns=columns)
+    return df
+
+def load(dataframe, table):
+    dataframe.to_sql(con=settings.DATABASE_CONNECTION_SUPERSET_MART, name=table, if_exists='append', index=False)
+
+# Определение последнего месяца, который есть в таблице debt_subscribe
+max_month = extract_max_month()
+print(f'max_month: {max_month}')
+
+# Получение данных для загрузки
+dataframe = create_dataset(max_month)
+print('Датафрейм debt_subscribe готов')
+
+# Запись новых данных
+load(dataframe, table='debt_subscribe_details')
+print('Данные debt_subscribe_details загружены')
