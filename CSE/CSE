@@ -135,5 +135,3 @@ columns = ["SummaryNumber", "Client", "Contract", "ContractCurrency",
 df = df[columns]
 
 df.to_sql("cse_orders", con=engine, if_exists="append", index=False)
-
-
