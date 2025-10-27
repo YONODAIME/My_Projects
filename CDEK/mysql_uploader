@@ -1,1 +1,67 @@
+from sqlalchemy import create_engine
+import settings
+import pandas as pd
+import os
+import glob
+import numpy as np
 
+# Данные пользователя
+username = settings.USER_SUMMARY
+password = settings.PASSWORD_SUMMARY
+host = settings.SERVER_SUMMARY
+port = '****'
+database = settings.DATABASE_RAW
+
+# Подключение к БД
+engine = create_engine(f"mysql+pymysql://{username}:{password}@{host}:{port}/{database}")
+
+# Находим последний файл в папке
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+folder = os.path.join(BASE_DIR, "sdek_reports")
+last_file_path = max(glob.glob(f"{folder}/*.xlsx"), key=os.path.getmtime)
+
+df = pd.read_excel(last_file_path)
+column_map = {
+    "Номер заказа": "order_number", "Логин": "login", "Номер отправления ИМ": "shipment_number",
+    "Дата накладной": "invoice_date", "Город отправителя": "sender_city",
+    "Город получателя": "receiver_city", "Отправитель": "sender_name", "Получатель": "receiver_name",
+    "Адрес получателя": "receiver_address", "Тел. Получателя": "receiver_phone",
+    "Плательщик": "payer", "Вес объёмный": "weight_volume", "Вес расчетный": "weight_calc",
+    "Вес фактический": "weight_fact", "Количество мест": "places_count",
+    "Наименование товара": "product_name", "Услуга": "service_type",
+    "Дата доставки по услуге": "service_delivery_date", "Дата фактической доставки": "delivery_actual_date",
+    "Просрочка": "overdue_days", "Срок хранения": "storage_days",
+    "Стоимость основной услуги": "base_service_cost", "Стоимость доп.услуг": "additional_services_cost",
+    "Итого": "total_cost", "Сумма НП": "cod_amount",
+    "Доп.сбор с получателя за доставку": "recipient_extra_delivery_fee",
+    "Итого с получателя при вручении": "recipient_total_upon_delivery",
+    "Сумма НП по ДД": "cod_by_dd", "Статус": "status", "Причина невручения": "delivery_fail_reason",
+    "№ возвратной накладной": "return_invoice_number",
+    "Стоимость основной услуги (возвр. заказа)": "return_base_service_cost"
+}
+
+# Переименовываем колонки
+df.rename(columns=column_map, inplace=True)
+
+# Преобразуем даты
+df['invoice_date'] = pd.to_datetime(df['invoice_date'], format='%d.%m.%Y', errors='coerce')
+df['service_delivery_date'] = pd.to_datetime(df['service_delivery_date'], format='%d.%m.%Y', errors='coerce')
+df['delivery_actual_date'] = pd.to_datetime(df['delivery_actual_date'], format='%d.%m.%Y', errors='coerce')
+
+# Заменяем все NaN на None (который станет NULL в SQL)
+df = df.replace({np.nan: None})
+
+columns = df.columns.tolist()
+placeholders = ", ".join(["%s"] * len(columns))
+columns_sql = ", ".join([f"`{col}`" for col in columns])
+update_sql = ", ".join([f"`{col}`=VALUES(`{col}`)" for col in columns if col != "order_number"])
+
+query = f"""
+INSERT INTO sdek_orders ({columns_sql}) 
+VALUES ({placeholders})
+ON DUPLICATE KEY UPDATE {update_sql}
+"""
+
+with engine.begin() as conn:
+    data = df.values.tolist()
+    conn.execute(query, data)
