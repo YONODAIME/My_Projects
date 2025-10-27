@@ -1,0 +1,160 @@
+SELECT LAST_NAME, TID, CASE WHEN IN_PROCESS_TIME > 5 AND IN_PROCESS_TIME < 15 THEN 10 ELSE IN_PROCESS_TIME END AS IN_PROCESS_TIME,
+       CASE WHEN TIMESTAMPDIFF(MINUTE, IN_PROCESS_DATE, POST_DATE) < 20 THEN 20
+    ELSE TIMESTAMPDIFF(MINUTE, IN_PROCESS_DATE, POST_DATE) END AS ANSWER,
+    CASE WHEN WORK_TIME < 320 THEN 320 ELSE WORK_TIME END AS WORK_TIME, COMPLEXITY, TAG
+    FROM (SELECT LAST_NAME, TID, IN_PROCESS_TIME, IN_PROCESS_DATE,
+work_time, COMPLEXITY, TAG
+    FROM (SELECT LAST_NAME, TID, TICKET_DATE_CREATE, IN_PROCESS_DATE, IN_PROCESS_TIME, COMPLEXITY, TAG, WORK_TIME
+    FROM (SELECT LAST_NAME, TID, TICKET_DATE_CREATE, IN_PROCESS_DATE, IN_PROCESS_TIME, COMPLEXITY, TAG
+    FROM (WITH PROCESS AS (
+    SELECT user.LAST_NAME, tasks.ID TID,
+           CASE
+        WHEN TIME(tasks.CREATED_DATE) > '16:45:00' OR calendar.holiday = 1
+            THEN (
+                SELECT STR_TO_DATE(CONCAT(MIN(calendar_date), ' ', '08:00:00'), '%Y-%m-%d %H:%i:%S')
+                FROM meta_data.calendar
+                WHERE calendar_date > DATE(tasks.CREATED_DATE)
+                  AND holiday IS NULL
+            )
+        WHEN TIME(tasks.CREATED_DATE) < '08:00:00'
+            THEN STR_TO_DATE(CONCAT(DATE_FORMAT(tasks.CREATED_DATE, '%Y-%m-%d'), ' ', '08:00:00'),
+                             '%Y-%m-%d %H:%i:%S')
+        ELSE tasks.CREATED_DATE
+    END AS TICKET_DATE_CREATE, tl.CREATED_DATE IN_PROCESS,
+    CASE WHEN UF_COMPLEXITY = 1673 THEN 'Простая'
+         WHEN UF_COMPLEXITY = 1674 THEN 'Сложная'
+         WHEN UF_COMPLEXITY = 1739 THEN 'Средняя'
+         ELSE UF_COMPLEXITY
+    END AS COMPLEXITY, GROUP_CONCAT(DISTINCT task_label.NAME ORDER BY task_label.NAME SEPARATOR ', ') AS TAG
+        FROM raw_data.b_tasks tasks
+    JOIN raw_data.b_tasks_log tl ON tasks.ID = tl.TASK_ID
+    JOIN raw_data.b_user user ON tl.USER_ID = user.ID
+    JOIN raw_data.b_uts_tasks_task uts_task ON tasks.ID = uts_task.VALUE_ID
+    LEFT JOIN raw_data.b_tasks_task_tag task_tag ON tasks.ID = task_tag.TASK_ID
+    LEFT JOIN raw_data.b_tasks_label task_label ON task_tag.TAG_ID = task_label.ID
+    JOIN meta_data.calendar calendar ON DATE(tasks.CREATED_DATE) = calendar.calendar_date
+    WHERE user.LAST_NAME = 'Пронечкин' AND tl.FIELD = 'STAGE' AND FROM_VALUE = 'Входящие' AND TO_VALUE = 'Выполняются' AND
+#           EXTRACT(YEAR_MONTH FROM tasks.CREATED_DATE) = EXTRACT(YEAR_MONTH FROM CURRENT_DATE)
+    tasks.CREATED_DATE LIKE '2025-09-%'
+    AND tasks.ID NOT IN (SELECT TASK_ID FROM raw_data.b_tasks_log WHERE FIELD = 'NEW' AND USER_ID = 44)
+    GROUP BY tasks.ID
+),
+
+IN_PROCESS AS (
+    SELECT LAST_NAME, TID, TICKET_DATE_CREATE,
+           CASE WHEN COALESCE((SELECT COUNT(*)
+                               FROM meta_data.calendar
+                               WHERE holiday = 1 AND calendar_date BETWEEN DATE(TICKET_DATE_CREATE) AND DATE(IN_PROCESS)), 0) = 0
+               THEN IN_PROCESS
+               ELSE
+                   DATE_SUB(IN_PROCESS, INTERVAL (SELECT COUNT(*) FROM meta_data.calendar WHERE holiday = 1
+                                                        AND calendar_date BETWEEN DATE(TICKET_DATE_CREATE) AND DATE(IN_PROCESS)) DAY)
+               END AS IN_PROCESS_DATE, COMPLEXITY, TAG
+        FROM raw_data.b_tasks_log tl
+    JOIN  PROCESS ON tl.TASK_ID = TID
+        GROUP BY TID
+)
+
+SELECT LAST_NAME, TID, TICKET_DATE_CREATE, IN_PROCESS_DATE,
+       CASE
+    WHEN TIMESTAMPDIFF(MINUTE, TICKET_DATE_CREATE, IN_PROCESS_DATE) <= 0
+        THEN 1
+    WHEN DATE(IN_PROCESS_DATE) = DATE(TICKET_DATE_CREATE)
+        THEN TIMESTAMPDIFF(MINUTE, TICKET_DATE_CREATE, IN_PROCESS_DATE)
+    ELSE TIMESTAMPDIFF(MINUTE, TICKET_DATE_CREATE, IN_PROCESS_DATE)
+           - (DATEDIFF(IN_PROCESS_DATE, TICKET_DATE_CREATE) * 900)
+END AS IN_PROCESS_TIME,
+       COMPLEXITY, TAG
+    FROM IN_PROCESS
+GROUP BY TID) tickets
+
+LEFT JOIN (SELECT tl.TASK_ID, tl.CREATED_DATE ADVANCE_RULING_DATE
+               FROM raw_data.b_tasks_log tl
+               WHERE (USER_ID = 3198 AND tl.FIELD = 'STAGE' AND tl.FROM_VALUE = 'Выполняются' AND TO_VALUE = 'Ожидаю ответа постановщика')
+               OR (USER_ID = 3198 AND tl.FIELD = 'STAGE' AND tl.FROM_VALUE = 'Выполняются' AND TO_VALUE = 'Сделаны')
+               OR (tl.FIELD = 'RESPONSIBLE_ID' AND tl.FROM_VALUE = 3198 AND USER_ID = 3198)) ADVANCE_RULING ON tickets.TID = TASK_ID
+GROUP BY TID) tickets
+
+JOIN (WITH TICKET_IN_PROCESS AS (SELECT TASK_ID TIPID, tl.CREATED_DATE INPROCESS
+    FROM raw_data.b_tasks_log tl
+JOIN raw_data.b_tasks tasks ON tasks.ID = tl.TASK_ID
+WHERE tl.USER_ID = 3198 AND tasks.ID NOT IN (SELECT TASK_ID FROM raw_data.b_tasks_log
+      tl WHERE FIELD = 'NEW' AND USER_ID = 44) AND tasks.CREATED_DATE LIKE '2025-09-%' AND
+tl.FIELD = 'STAGE' AND tl.FROM_VALUE = 'Входящие' AND TO_VALUE = 'Выполняются'),
+
+COMPLETE AS (SELECT TASK_ID CID, tl.CREATED_DATE COMPLETE_DATE
+    FROM raw_data.b_tasks_log tl
+WHERE tl.USER_ID = 3198 AND tl.FIELD = 'STAGE' AND
+      ((tl.FROM_VALUE = 'Выполняются' AND TO_VALUE = 'Сделаны') OR (tl.FROM_VALUE = 'Ожидаю ответа постановщика' AND TO_VALUE = 'Сделаны'))),
+
+AWAITING AS (SELECT TASK_ID AID, tl.CREATED_DATE AWAITING_DATE
+    FROM raw_data.b_tasks_log tl
+WHERE tl.USER_ID = 3198 AND tl.FIELD = 'STAGE' AND (tl.FROM_VALUE = 'Выполняются' AND TO_VALUE = 'Ожидаю ответа постановщика')),
+
+RESP AS (SELECT TASK_ID RID, MIN(tl.CREATED_DATE) CHANGE_DATE
+    FROM raw_data.b_tasks_log tl
+WHERE tl.USER_ID = 3198 AND tl.FIELD = 'RESPONSIBLE_ID' AND tl.FROM_VALUE = '3198'
+GROUP BY TASK_ID)
+
+SELECT ID, INPROCESS, COMPLETE_DATE, AWAITING_DATE, CHANGE_DATE, WORKDATETIME,
+       CASE WHEN COMPLETE_DATE IS NOT NULL AND AWAITING_DATE IS NULL THEN TIMESTAMPDIFF(MINUTE, INPROCESS, COMPLETE_DATE)
+        WHEN (COMPLETE_DATE IS NULL OR COMPLETE_DATE IS NOT NULL) AND AWAITING_DATE IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, INPROCESS, AWAITING_DATE)
+        WHEN COMPLETE_DATE IS NULL AND AWAITING_DATE IS NULL AND CHANGE_DATE IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, INPROCESS, CHANGE_DATE)
+        WHEN COMPLETE_DATE IS NULL AND AWAITING_DATE IS NULL AND CHANGE_DATE IS NULL THEN TIMESTAMPDIFF(MINUTE, INPROCESS, WORKDATETIME)
+        END AS WORK_TIME
+    FROM (SELECT ID,
+       INPROCESS,
+       CASE WHEN DATE(WORKDATETIME) = DATE(INPROCESS) THEN WORKDATETIME
+           ELSE DATE_SUB(WORKDATETIME, INTERVAL DATEDIFF(WORKDATETIME, INPROCESS) * 900 MINUTE)
+           END AS WORKDATETIME,
+       CASE WHEN DATE(COMPLETE_DATE) = DATE(INPROCESS) THEN COMPLETE_DATE
+           ELSE DATE_SUB(COMPLETE_DATE, INTERVAL DATEDIFF(COMPLETE_DATE, INPROCESS) * 900 MINUTE)
+               END AS COMPLETE_DATE,
+    CASE WHEN DATE(AWAITING_DATE) = DATE(INPROCESS) THEN AWAITING_DATE
+           ELSE DATE_SUB(AWAITING_DATE, INTERVAL DATEDIFF(AWAITING_DATE, INPROCESS) * 900 MINUTE)
+               END AS AWAITING_DATE,
+       CASE WHEN DATE(CHANGE_DATE) = DATE(INPROCESS) THEN CHANGE_DATE
+           ELSE DATE_SUB(CHANGE_DATE, INTERVAL DATEDIFF(CHANGE_DATE, INPROCESS) * 900 MINUTE)
+               END AS CHANGE_DATE
+    FROM (SELECT TIPID AS ID,
+       INPROCESS,
+       CASE WHEN COALESCE((SELECT COUNT(*) FROM meta_data.calendar
+                            WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND CURRENT_DATE), 0) = 0
+           THEN NOW()
+           ELSE DATE_SUB(NOW(), INTERVAL (SELECT COUNT(*) FROM meta_data.calendar
+                                            WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND CURRENT_DATE) DAY) END AS WORKDATETIME,
+       CASE WHEN COALESCE((SELECT COUNT(*) FROM meta_data.calendar
+                            WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND DATE(COMPLETE_DATE)), 0) = 0
+           THEN COMPLETE_DATE
+           ELSE DATE_SUB(COMPLETE_DATE, INTERVAL (SELECT COUNT(*) FROM meta_data.calendar
+                                                   WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND DATE(COMPLETE_DATE)) DAY) END AS COMPLETE_DATE,
+       CASE WHEN COALESCE((SELECT COUNT(*) FROM meta_data.calendar
+                            WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND DATE(AWAITING_DATE)), 0) = 0
+           THEN AWAITING_DATE
+           ELSE DATE_SUB(AWAITING_DATE, INTERVAL (SELECT COUNT(*) FROM meta_data.calendar
+                                                   WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND DATE(AWAITING_DATE)) DAY) END AS AWAITING_DATE,
+       CASE WHEN COALESCE((SELECT COUNT(*) FROM meta_data.calendar
+                            WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND DATE(CHANGE_DATE)), 0) = 0
+           THEN CHANGE_DATE
+           ELSE DATE_SUB(CHANGE_DATE, INTERVAL (SELECT COUNT(*) FROM meta_data.calendar
+                                                   WHERE holiday = 1 AND calendar_date BETWEEN DATE(INPROCESS) AND DATE(CHANGE_DATE)) DAY) END AS CHANGE_DATE
+    FROM TICKET_IN_PROCESS
+LEFT JOIN COMPLETE ON TIPID = CID
+LEFT JOIN AWAITING ON TIPID = AID
+LEFT JOIN RESP ON TIPID = RID) holiday
+ WHERE TIMESTAMPDIFF(MINUTE, INPROCESS, CHANGE_DATE) > 0
+    ) work_time
+GROUP BY ID) work_time ON tickets.TID = work_time.ID) tickets) tickets
+
+LEFT JOIN (
+    SELECT *
+    FROM (
+        SELECT
+            bfm.*,
+            ROW_NUMBER() OVER (PARTITION BY SUBSTRING_INDEX(bfm.XML_ID, '_', -1)
+                               ORDER BY bfm.POST_DATE) AS rn
+        FROM raw_data.b_forum_message bfm
+        WHERE bfm.AUTHOR_ID = 3198
+    ) t
+    WHERE rn = 2) bfm ON tickets.TID = SUBSTRING_INDEX(bfm.XML_ID, '_', -1);
+
