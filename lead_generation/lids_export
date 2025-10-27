@@ -1,0 +1,100 @@
+import gspread
+from google.oauth2.service_account import Credentials
+import pandas as pd
+from sqlalchemy import create_engine
+from gspread_formatting import CellFormat, textFormat, format_cell_range
+import settings
+
+# Авторизация Google API
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+client = gspread.service_account(filename='../storage/keys/analytics-autotracker-276a3cecab72.json')
+
+# Открытие таблицы и листа
+spreadsheet = client.open_by_key('1pzurHgCUn5e5xRHFNoXxmw48L6qdea87gSSPNhjb0R0')
+sheet = spreadsheet.worksheet('Лист для тестовой автовыгрузки')
+
+# Параметры подключения к БД
+user = settings.USER_SUMMARY
+password = settings.PASSWORD_SUMMARY
+host = settings.SERVER_SUMMARY
+port = '****'
+database = settings.DATABASE_RAW
+
+# SQL-запрос
+query = """SELECT
+    CONCAT('https://portal.stavtrack.ru/crm/lead/details/', lid.ID, '/') 'Ссылка на лид',
+    status.NAME 'Статус',
+    lid.TITLE 'Название лида',
+    lid.DATE_CREATE 'Дата создания лида',
+    event.DATE_CREATE 'Последнее касание',
+    orders.product 'Направление',
+    orders.region 'Город',
+    REGEXP_REPLACE(orders.phone, '[^0-9]', '') AS 'Телефон',
+    user.LAST_NAME 'Ответственный за лид',
+    CASE WHEN tasks.CREATED_DATE IS NULL THEN 'Нет задачи' ELSE tasks.CREATED_DATE END AS 'Дата создания задачи',
+    tasks.CLOSED_DATE 'Дата закрытия задачи'
+FROM raw_data.b_crm_lead lid
+JOIN raw_data.b_crm_status status ON lid.STATUS_ID = status.STATUS_ID
+JOIN raw_data.b_user user ON lid.ASSIGNED_BY_ID = user.ID
+LEFT JOIN raw_data.orders orders ON lid.ID = orders.lid_bitrix_id
+LEFT JOIN raw_data.b_utm_tasks_task utt ON CAST(SUBSTRING_INDEX(utt.VALUE, '_', -1) AS UNSIGNED) = lid.ID AND utt.VALUE LIKE 'L_%%'
+LEFT JOIN (
+    SELECT ID, CREATED_DATE, CLOSED_DATE
+    FROM raw_data.b_tasks
+    WHERE ID IN (
+        SELECT VALUE_ID FROM raw_data.b_utm_tasks_task WHERE VALUE LIKE 'L_%%'
+    )
+) tasks ON utt.VALUE_ID = tasks.ID
+LEFT JOIN (
+    SELECT
+        er.ENTITY_ID AS EI,
+        MAX(event.DATE_CREATE) AS DATE_CREATE
+    FROM raw_data.b_crm_event_relations er
+    JOIN raw_data.b_crm_event event ON er.EVENT_ID = event.ID
+    WHERE
+        er.ENTITY_TYPE = 'LEAD'
+        AND event.EVENT_NAME != 'Просмотр'
+        AND event.DATE_CREATE >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+    GROUP BY er.ENTITY_ID
+) event ON lid.ID = event.EI
+WHERE
+    lid.DATE_CREATE >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+    AND lid.DATE_CREATE < CURRENT_DATE
+    AND status.name IN (
+        'Подготовка', 'Ключ на старт. Звонок назначен', 'Второй шаг. Поставь звонок!',
+        'Третий раз. Проверь дату звонка!', 'Последний шанс', 'Передано чекисту',
+        'Проиграна битва, но не война', 'Самара-городок', 'Временный недозвон',
+        'Реанимирован', 'Реанимирован+', 'На перспективу', 'Не смог продать, причина не ясна',
+        'Не выходит на связь', 'Не смог продать из-за отсутствия оборудования, а клиент не готов ждать',
+        'Не смог продать, передаю в Лидогенерацию', 'Тендер в котором не участвуем (Игорь отказал в торгах)',
+        'Не продали из-за срока монтажа', 'В данном городе (регионе) отсутствует монтажная группа',
+        'Левая тема - хочет отслеживать обезьянку', 'Клиент просит не выполнимые условия (указать в названии)',
+        'Дубль или действующий Клиент (привязать к компании)', 'Не успели ответить, а уже договорился с другими',
+        'Прошу передать другому, не знаю продукт или не нашел общий язык', 'Дорого, отказ от ГЛЦ',
+        'Работа с тахографами, картами и т.п. где не делаем работы', 'Партнеры', 'У нас нет такого решения',
+        'Установили у других (причину указать в названии)', 'Распродал автопарк или ушел в другую сферу (взять контакты нового владельца)',
+        'Тикет', 'ХУРМА'
+    )
+    AND (tasks.CREATED_DATE IS NULL OR tasks.CLOSED_DATE IS NOT NULL)
+GROUP BY lid.ID
+"""
+
+# Получение данных из БД
+engine = create_engine(f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}")
+df = pd.read_sql(query, engine)
+
+# Преобразование значений в строки
+df = df.astype(str)
+values = df.values.tolist()
+
+# Очистка и вставка в таблицу со второй строки
+sheet.resize(rows=len(values) + 1)
+sheet.update('A2', values)
+
+# Применение форматирования — шрифт обычный, размер 10
+cell_format = CellFormat(textFormat=textFormat(bold=False, fontSize=10))
+range_to_format = f"A2:Z{len(values)+1}"
+format_cell_range(sheet, range_to_format, cell_format)
