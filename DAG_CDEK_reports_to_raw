@@ -47,4 +47,4 @@ with DAG(
     )
 
     # Последовательность: сначала скачиваем, потом обрабатываем, потом завершаем
-    sdek_downloader >> sdek_processor >> pipeline_done
+    sdek_downloader >> mysql_uploader >> pipeline_done
