@@ -1,0 +1,49 @@
+SELECT prosrochka.ID, CASE WHEN tasks.GROUP_ID = 570 THEN
+    CONCAT('<a href="https://portal.stavtrack.ru/workgroups/group/570/tasks/task/view/', prosrochka.ID, '/', '" target="_portal.stavtrack">', prosrochka.TITLE, '</a>')
+    WHEN tasks.GROUP_ID = 241 THEN
+        CONCAT('<a href="https://portal.stavtrack.ru/workgroups/group/241/tasks/task/view/', prosrochka.ID, '/', '" target="_portal.stavtrack">', prosrochka.TITLE, '</a>') END AS 'Ссылка на задачу',
+       tasks.GROUP_ID AS 'Проект', prosrochka.resp AS 'Принявший задачу',
+       prosrochka.CREATED_DATE 'Дата постановки задачи', prosrochka.CHANGE_DATE 'Взята в работу' FROM
+             (WITH CTE1 AS (SELECT tasks.ID ID,  CONCAT('https://portal.stavtrack.ru/workgroups/group/241/tasks/task/view/', tasks.ID, '/') task_link, tasks.CREATED_DATE C1
+FROM raw_data.b_tasks tasks
+JOIN raw_data.b_tasks_log tlog
+    ON tasks.ID = tlog.TASK_ID
+WHERE tlog.FIELD = 'NEW'
+
+  AND tasks.GROUP_ID IN (241, 570)
+  AND tasks.CREATED_DATE >= DATE_FORMAT(CURRENT_DATE, '%Y-%m-01') AND tasks.CREATED_DATE < DATE_FORMAT(CURRENT_DATE + INTERVAL 1 MONTH, '%Y-%m-01')),
+
+ CTE2 AS (SELECT tasks.ID ID, CONCAT('https://portal.stavtrack.ru/workgroups/group/241/tasks/task/view/', tasks.ID, '/') task_link, MIN(tlog.CREATED_DATE) C2, user.LAST_NAME AS resp
+FROM raw_data.b_tasks tasks
+JOIN raw_data.b_tasks_log tlog
+    ON tasks.ID = tlog.TASK_ID
+JOIN raw_data.b_user user ON tlog.USER_ID = user.ID
+WHERE tlog.FIELD = 'STAGE' AND tlog.TO_VALUE = 'Выполняются' AND tasks.GROUP_ID IN (241, 570) AND tasks.CREATED_DATE >= DATE_FORMAT(CURRENT_DATE, '%Y-%m-01')
+AND tasks.CREATED_DATE < DATE_FORMAT(CURRENT_DATE + INTERVAL 1 MONTH, '%Y-%m-01')
+GROUP BY tasks.ID)
+
+SELECT tasks.ID, CTE1.task_link, tasks.CREATED_DATE, tasks.GROUP_ID, CTE2.resp, CTE2.C2 AS CHANGE_DATE, tasks.TITLE TITLE
+    FROM raw_data.b_tasks tasks
+JOIN raw_data.b_user user
+    ON tasks.RESPONSIBLE_ID = user.ID
+LEFT JOIN CTE1 ON CTE1.ID = tasks.ID
+LEFT JOIN CTE2 ON CTE2.ID = tasks.ID
+WHERE TIMESTAMPDIFF(MINUTE, CTE1.C1, CTE2.C2) >= 15 AND tasks.GROUP_ID IN (241, 570)) prosrochka
+
+
+
+                 JOIN raw_data.b_tasks tasks
+                    ON prosrochka.ID = tasks.ID
+
+                 JOIN raw_data.b_user user
+                    ON tasks.RESPONSIBLE_ID = user.ID
+
+                 JOIN meta_data.calendar calendar
+                    ON DATE(tasks.CREATED_DATE) = calendar.calendar_date
+
+WHERE TIME(prosrochka.CREATED_DATE) BETWEEN '08:00:00' AND '16:59:00' AND calendar.holiday IS NULL AND LAST_NAME NOT IN ('Хорошилов', 'Грипас', 'Карастелев')
+GROUP BY prosrochka.ID
+LIMIT 1000;
+
+
+
