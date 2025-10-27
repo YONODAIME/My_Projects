@@ -1,0 +1,50 @@
+from airflow import DAG
+from airflow.operators.empty import EmptyOperator
+from airflow.providers.ssh.operators.ssh import SSHOperator
+from airflow.utils.trigger_rule import TriggerRule
+from datetime import datetime, timedelta
+
+with DAG(
+    dag_id="sdek_report_pipeline",
+    description="Скачивает отчет СДЭК и забирает из него данные в RAW",
+    start_date=datetime(2025, 8, 8),
+    schedule_interval=timedelta(days=1),
+    catchup=False,
+    tags=["SDEK", "report"]
+) as dag:
+
+    pipeline_done = EmptyOperator(
+        task_id="done",
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
+    )
+
+    #скачивание отчета
+    sdek_downloader = SSHOperator(
+        task_id="download_sdek_report",
+        ssh_conn_id="ssh_etl_helpers",
+        conn_timeout=60,
+        cmd_timeout=3600,
+        command="""
+            cd bi-etl-helpers
+            source venv/bin/activate
+            cd CDEK_reports
+            python sdek_downloader.py
+        """
+    )
+
+    #забираем из отчета данные
+    sdek_processor = SSHOperator(
+        task_id="process_sdek_report",
+        ssh_conn_id="ssh_etl_helpers",
+        conn_timeout=60,
+        cmd_timeout=3600,
+        command="""
+            cd bi-etl-helpers
+            source venv/bin/activate
+            cd CDEK_reports
+            python mysql_uploader.py
+        """
+    )
+
+    # Последовательность: сначала скачиваем, потом обрабатываем, потом завершаем
+    sdek_downloader >> sdek_processor >> pipeline_done
