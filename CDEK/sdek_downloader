@@ -1,0 +1,112 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+import os
+from datetime import datetime, timedelta
+from dateutil import parser
+import settings
+
+#Сегодняшняя дата
+today = datetime.today()
+
+#два месяца назад
+month = today.month - 2
+year = today.year
+
+if month <= 0:
+    month += 12
+    year -= 1
+
+start_date = datetime(year, month, 1)
+months_ru = ["янв.", "фев.", "мар.", "апр.", "мая", "июн.",
+          "июл.", "авг.", "сен.", "окт.", "ноя", "дек."]
+
+def format_date(date):
+    return f"{date.day} {months_ru[date.month - 1]} {date.year}"
+
+date_from = format_date(start_date)
+date_to = format_date(today)
+print("От:", date_from)
+print("До:", date_to)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+download_dir = os.path.join(BASE_DIR, "sdek_reports")
+os.makedirs(download_dir, exist_ok=True)
+
+options = Options()
+options.add_experimental_option("detach", True)
+prefs = {"download.default_directory": download_dir,
+    "download.prompt_for_download": False,
+    "download.directory_upgrade": True,
+    "safebrowsing.enabled": True}
+options.add_experimental_option("prefs", prefs)
+
+driver = webdriver.Chrome(options=options)
+
+driver.get("https://lk.cdek.ru/user/login")
+
+wait = WebDriverWait(driver, 20)
+login_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[placeholder="Логин или Email"]')))
+password_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[placeholder="Пароль"]')))
+
+#Авторизация
+username = settings.CDEK_LOGIN
+password = settings.CDEK_PASSWORD
+
+login_input.send_keys(username)
+password_input.send_keys(password)
+
+login_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-testid="button-sign-up"]')))
+login_button.click()
+
+#Закрытие всплывающего окна
+try:
+    close_popup = WebDriverWait(driver, 10.).until(EC.element_to_be_clickable((By.CLASS_NAME, "uikit-headerModal-button")))
+    close_popup.click()
+    print("Всплывающее окно закрыто")
+except:
+    print("Всплывающее окно не появилось или уже закрыто")
+
+#Создать отчет
+create_report_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="buttonCreateReport"]')))
+create_report_button.click()
+
+#Временной промежуток
+#От
+button_before = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="orderDatepickerFrom-show-button"]')))
+button_before.click()
+from_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[data-testid="orderDatepickerFrom-input"]')))
+from_input.clear()
+from_input.send_keys(date_from)
+#До
+button_to = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="orderDatepickerTo-show-button"]')))
+button_to.click()
+to_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[data-testid="orderDatepickerTo-input')))
+to_input.clear()
+to_input.send_keys(date_to)
+
+#Кликнем по пустому месту, чтобы закрыть календарь
+modal_header = wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "uikit-headerModal-title")))
+modal_header.click()
+time.sleep(0.5)
+
+#Создание отчета
+button_Create_report = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="createReportModalButtonCreate"]')))
+button_Create_report.click()
+created_at = datetime.now()
+
+#Переход в отчеты
+time.sleep(10) # На создание отчета может потребоваться время, лучше подождать немного
+button_going_to_reports = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="createReportModalButtonGoToReports"]')))
+button_going_to_reports.click()
+
+# Скачивание только что созданного отчета
+button_download_report = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="reportRowButtonDownloadFile-0-reportRow-0"]')))
+button_download_report.click()
+
+
+
