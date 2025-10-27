@@ -1,0 +1,139 @@
+from zeep import Client
+from zeep.transports import Transport
+from decimal import Decimal
+from pprint import pprint
+import settings
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+# Авторизация
+username = settings.USER_SUMMARY
+password1 = settings.PASSWORD_SUMMARY
+host = settings.SERVER_SUMMARY
+database = settings.DATABASE_RAW
+LOGIN = settings.CSE_LOGIN
+PASSWORD = settings.CSE_PASSWORD
+# Адрес боевого сервиса
+WSDL_URL = "http://web.cse.ru/1c/ws/Web1C.1cws?wsdl"
+
+
+def call_report(report_name, login, password, extra_params=None):
+    """
+    Вызов метода Report через SOAP
+    report_name: имя отчёта (например: 'SummaryOfPayments', 'ReturnOfGoods')
+    extra_params: список троек (Key, ValueType, Value)
+    """
+    client = Client(wsdl=WSDL_URL, transport=Transport(timeout=60))
+
+    # Параметры для SOAP
+    params = {
+        "Key": "parameters",
+        "List": [
+            {"Key": "Reference", "Value": report_name, "ValueType": "string"}
+        ]
+    }
+
+    # Добавляем доп. параметры
+    if extra_params:
+        for key, vtype, value in extra_params:
+            params["List"].append({
+                "Key": key,
+                "Value": value,
+                "ValueType": vtype
+            })
+
+    # Вызов метода Report
+    response = client.service.Report(login, password, report_name, params)
+    return response
+
+
+def extract_fields(fields):
+    """Преобразует массив Fields/Properties в dict"""
+    result = {}
+    for f in fields:
+        key = getattr(f, "Key", None) or f.get("Key")
+        val = getattr(f, "Value", None) if hasattr(f, "Value") else f.get("Value")
+        result[key] = val
+    return result
+
+
+def parse_summary_of_payments(result):
+    """
+    Разбор структуры ответа 'SummaryOfPayments'
+    Возвращает список словарей (каждая строка таблицы = один заказ/накладная)
+    """
+    rows_out = []
+
+    for summary in result.List:  # каждый 'SummaryOfWaybills'
+        header = extract_fields(summary.Fields or [])
+        props = extract_fields(summary.Properties or [])
+
+        for service in summary.List:  # ServiceName (Россия доставка, Внутрирегиональная и т.п.)
+            service_name = service.Value
+            # service_props = extract_fields(service.Properties or [])
+
+            for row in service.Rows:
+                cells = row.Cells
+
+                entry = {
+                    "WaybillNumber": cells[2],
+                    "OrderNumber": cells[3],
+                    "PickupDate": cells[4],
+                    "Origin": cells[6],
+                    "Destination": cells[7],
+                    "Urgency": cells[8],
+                    "TypeOfCargo": cells[9],
+                    "DeliveryDate": cells[10],
+                    "RecipientPerson": cells[11],
+                    "Qty": float(cells[12]) if isinstance(cells[12], Decimal) else cells[12],
+                    "Weight": float(cells[13]) if isinstance(cells[13], Decimal) else cells[13],
+                    "Price": float(cells[14]) if isinstance(cells[14], Decimal) else cells[14],
+                    "Client": header.get("Client"),
+                    "Contract": header.get("Contract"),
+                    "ContractCurrency": header.get("ContractCurrency"),
+                    "ServiceName": service_name,
+                    "SummaryNumber": props.get("Number")
+                }
+                rows_out.append(entry)
+
+    return rows_out
+
+
+if __name__ == "__main__":
+    today = datetime.today()
+
+    date_from = (today - relativedelta(months=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    date_to = today.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    result = call_report(
+        "SummaryOfPayments",
+        login=LOGIN,
+        password=PASSWORD,
+        extra_params=[
+            ("DateFrom", "dateTime", date_from.isoformat()),
+            ("DateTo", "dateTime", date_to.isoformat()),
+        ]
+    )
+
+    orders = parse_summary_of_payments(result)
+
+engine = create_engine(
+    f"mysql+pymysql://{username}:{password1}"
+    f"@{host}/{database}?charset=utf8mb4"
+)
+
+df = pd.DataFrame(orders)
+
+columns = ["SummaryNumber", "Client", "Contract", "ContractCurrency",
+    "ServiceName", "WaybillNumber", "OrderNumber",
+    "PickupDate", "DeliveryDate", "Origin", "Destination",
+    "Urgency", "TypeOfCargo", "RecipientPerson",
+    "Qty", "Weight", "Price"]
+df = df[columns]
+
+df.to_sql("cse_orders", con=engine, if_exists="append", index=False)
+
+
