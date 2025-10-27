@@ -33,7 +33,7 @@ with DAG(
     )
 
     #забираем из отчета данные
-    sdek_processor = SSHOperator(
+    mysql_uplpader = SSHOperator(
         task_id="process_sdek_report",
         ssh_conn_id="ssh_etl_helpers",
         conn_timeout=60,
