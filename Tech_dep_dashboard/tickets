@@ -1,1 +1,439 @@
+WITH
+engineers AS (
+    SELECT DISTINCT du.ID
+    FROM raw_data.b_user du
+    INNER JOIN raw_data.b_utm_user uu ON uu.VALUE_ID = du.ID
+    INNER JOIN raw_data.b_iblock_section s ON s.ID = uu.VALUE_INT
+    WHERE s.IBLOCK_ID = 1
+      AND du.ACTIVE = 'y'
+      AND s.NAME IN ('Инженеры', 'Склад', 'Контроль качества')
+),
 
+TIME AS (
+    WITH TICKETS_DATE_CREATE AS (
+        SELECT
+            tl.TASK_ID AS tID,
+            MIN(u.LAST_NAME) AS LAST_NAME,
+            EXTRACT(YEAR_MONTH FROM tasks.CREATED_DATE) AS YEARMONTH,
+            CASE
+                WHEN TIME(tasks.CREATED_DATE) > '16:45:00' OR cal.holiday = 1 THEN (
+                    SELECT STR_TO_DATE(CONCAT(MIN(calendar_date), ' ', '08:00:00'), '%%Y-%%m-%%d %%H:%%i:%%S')
+                    FROM meta_data.calendar
+                    WHERE calendar_date > DATE(tasks.CREATED_DATE)
+                      AND holiday IS NULL
+                )
+                WHEN TIME(tasks.CREATED_DATE) < '08:00:00' THEN
+                    STR_TO_DATE(
+                        CONCAT(DATE_FORMAT(tasks.CREATED_DATE, '%%Y-%%m-%%d'), ' ', '08:00:00'),
+                        '%%Y-%%m-%%d %%H:%%i:%%S'
+                    )
+                ELSE tasks.CREATED_DATE
+            END AS TICKET_DATE_CREATE,
+            tl.CREATED_DATE
+        FROM raw_data.b_tasks_log tl
+        INNER JOIN raw_data.b_tasks tasks ON tl.TASK_ID = tasks.ID
+        INNER JOIN raw_data.b_user u ON tl.USER_ID = u.ID
+        INNER JOIN meta_data.calendar cal ON DATE(tasks.CREATED_DATE) = cal.calendar_date
+        INNER JOIN engineers e ON e.ID = tl.USER_ID
+        WHERE tl.TO_VALUE = 'Выполняются'
+             AND tasks.CREATED_DATE >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 4 MONTH), '%%Y-%%m-01')
+             AND tasks.CREATED_DATE <  DATE_ADD(DATE_FORMAT(CURDATE(), '%%Y-%%m-01'), INTERVAL 1 MONTH)
+          AND tasks.ID NOT IN (
+              SELECT TASK_ID
+              FROM raw_data.b_tasks_log
+              WHERE FIELD = 'NEW' AND USER_ID = 44
+          )
+        GROUP BY tl.TASK_ID
+    ),
+
+    TICKET_EXECUTION_DATE AS (
+        SELECT
+            tdc.tID,
+            tdc.LAST_NAME,
+            tdc.YEARMONTH,
+            tdc.TICKET_DATE_CREATE,
+            CASE
+                WHEN COALESCE((
+                    SELECT COUNT(*)
+                    FROM meta_data.calendar
+                    WHERE holiday = 1
+                      AND calendar_date BETWEEN DATE(tdc.TICKET_DATE_CREATE) AND DATE(tdc.CREATED_DATE)
+                ), 0) = 0
+                THEN tdc.CREATED_DATE
+                ELSE DATE_SUB(
+                    tdc.CREATED_DATE,
+                    INTERVAL (
+                        SELECT COUNT(*)
+                        FROM meta_data.calendar
+                        WHERE holiday = 1
+                          AND calendar_date BETWEEN DATE(tdc.TICKET_DATE_CREATE) AND DATE(tdc.CREATED_DATE)
+                    ) DAY
+                )
+            END AS EXECUTION_DATE
+        FROM TICKETS_DATE_CREATE tdc
+        INNER JOIN meta_data.calendar cal ON DATE(tdc.TICKET_DATE_CREATE) = cal.calendar_date
+    )
+
+    SELECT
+        tdc.tID,
+        tdc.LAST_NAME,
+        tdc.YEARMONTH,
+        ted.EXECUTION_DATE,
+        CASE
+            WHEN (
+                CASE
+                    WHEN TIMESTAMPDIFF(DAY, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE) >= 1
+                        THEN TIMESTAMPDIFF(MINUTE, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE)
+                             - (DATEDIFF(ted.EXECUTION_DATE, tdc.TICKET_DATE_CREATE) * 900)
+                    WHEN TIMESTAMPDIFF(MINUTE, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE) <= 0
+                        THEN 1
+                    ELSE TIMESTAMPDIFF(MINUTE, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE)
+                END
+            ) >= 1000
+            THEN 1
+            ELSE (
+                CASE
+                    WHEN TIMESTAMPDIFF(DAY, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE) >= 1
+                        THEN TIMESTAMPDIFF(MINUTE, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE)
+                             - (DATEDIFF(ted.EXECUTION_DATE, tdc.TICKET_DATE_CREATE) * 900)
+                    WHEN TIMESTAMPDIFF(MINUTE, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE) <= 0
+                        THEN 1
+                    ELSE TIMESTAMPDIFF(MINUTE, tdc.TICKET_DATE_CREATE, ted.EXECUTION_DATE)
+                END
+            )
+        END AS TIME_TO_EXECUTION
+    FROM TICKETS_DATE_CREATE tdc
+    INNER JOIN TICKET_EXECUTION_DATE ted ON tdc.tID = ted.tID
+),
+
+COMPLETE_TIME AS (
+    WITH COMPLETE_TIME_BASE AS (
+        SELECT
+            tl.TASK_ID,
+            tl.CREATED_DATE,
+            EXTRACT(YEAR_MONTH FROM tasks.CREATED_DATE) AS YEARMONTH,
+            d.STAKEHOLDER_ANSWER_TIME,
+            t.COMPLETE,
+            e.STAKEHOLDER_ANSWER_TO_COMPLETE,
+            a.WAIT_TO_EXECUTE,
+            r.RESP_CHANGE
+        FROM raw_data.b_tasks_log tl
+        INNER JOIN raw_data.b_tasks tasks ON tl.TASK_ID = tasks.ID
+
+        LEFT JOIN (
+            SELECT
+                tl.TASK_ID AS tID,
+                MIN(tl.CREATED_DATE) AS COMPLETE
+            FROM raw_data.b_tasks_log tl
+            INNER JOIN raw_data.b_tasks tasks ON tl.TASK_ID = tasks.ID
+            WHERE (
+                tl.USER_ID IN (SELECT ID FROM engineers)
+                AND tl.TO_VALUE = 'Сделаны'
+                AND tl.FROM_VALUE = 'Выполняются'
+            )
+            OR (tl.FIELD = 'STATUS' AND tl.TO_VALUE = 5)
+            GROUP BY tl.TASK_ID
+        ) t ON t.tID = tl.TASK_ID
+
+        LEFT JOIN (
+            SELECT
+                tl.TASK_ID AS tID,
+                MIN(tl.CREATED_DATE) AS STAKEHOLDER_ANSWER_TIME
+            FROM raw_data.b_tasks_log tl
+            INNER JOIN raw_data.b_tasks tasks ON tl.TASK_ID = tasks.ID
+            WHERE tl.USER_ID IN (SELECT ID FROM engineers)
+              AND tl.TO_VALUE = 'Ожидаю ответа постановщика'
+              AND tl.FROM_VALUE = 'Выполняются'
+            GROUP BY tl.TASK_ID
+        ) d ON d.tID = tl.TASK_ID
+
+        LEFT JOIN (
+            SELECT
+                tl.TASK_ID AS tID,
+                MIN(tl.CREATED_DATE) AS STAKEHOLDER_ANSWER_TO_COMPLETE
+            FROM raw_data.b_tasks_log tl
+            INNER JOIN raw_data.b_tasks tasks ON tl.TASK_ID = tasks.ID
+            WHERE tl.USER_ID IN (SELECT ID FROM engineers)
+              AND tl.TO_VALUE = 'Сделаны'
+              AND tl.FROM_VALUE = 'Ожидаю ответа постановщика'
+            GROUP BY tl.TASK_ID
+        ) e ON e.tID = tl.TASK_ID
+
+        LEFT JOIN (
+            SELECT
+                tl.TASK_ID AS tID,
+                MIN(tl.CREATED_DATE) AS RESP_CHANGE
+            FROM raw_data.b_tasks_log tl
+            INNER JOIN raw_data.b_tasks tasks ON tl.TASK_ID = tasks.ID
+            WHERE tl.FIELD = 'RESPONSIBLE_ID'
+              AND tl.FROM_VALUE IN (SELECT CAST(ID AS CHAR) FROM engineers)
+            GROUP BY tl.TASK_ID
+        ) r ON r.tID = tl.TASK_ID
+
+        LEFT JOIN (
+            SELECT
+                tl.TASK_ID AS tID,
+                MIN(tl.CREATED_DATE) AS WAIT_TO_EXECUTE
+            FROM raw_data.b_tasks_log tl
+            INNER JOIN raw_data.b_tasks tasks ON tl.TASK_ID = tasks.ID
+            WHERE tl.FROM_VALUE = 'Ожидаю ответа постановщика'
+              AND tl.TO_VALUE = 'Выполняются'
+              AND tl.USER_ID IN (SELECT CAST(ID AS CHAR) FROM engineers)
+            GROUP BY tl.TASK_ID
+        ) a ON a.tID = tl.TASK_ID
+
+        WHERE tl.USER_ID IN (SELECT ID FROM engineers)
+          AND tl.TO_VALUE = 'Выполняются'
+          AND tl.FROM_VALUE = 'Входящие'
+           AND tasks.CREATED_DATE >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 4 MONTH), '%%Y-%%m-01')
+           AND tasks.CREATED_DATE <  DATE_ADD(DATE_FORMAT(CURDATE(), '%%Y-%%m-01'), INTERVAL 1 MONTH)
+          AND tasks.ID NOT IN (
+              SELECT TASK_ID
+              FROM raw_data.b_tasks_log
+              WHERE FIELD = 'NEW' AND USER_ID = 44
+          )
+        GROUP BY tl.TASK_ID, tl.CREATED_DATE, d.STAKEHOLDER_ANSWER_TIME, t.COMPLETE,
+                 e.STAKEHOLDER_ANSWER_TO_COMPLETE, a.WAIT_TO_EXECUTE, r.RESP_CHANGE
+    ),
+
+    COMPLETE_RIGHT_TIME AS (
+        SELECT
+            ctb.TASK_ID,
+            ctb.CREATED_DATE,
+            ctb.YEARMONTH,
+            CASE
+                WHEN COALESCE((
+                    SELECT COUNT(*)
+                    FROM meta_data.calendar
+                    WHERE holiday = 1
+                      AND calendar_date BETWEEN DATE(ctb.CREATED_DATE) AND DATE(ctb.STAKEHOLDER_ANSWER_TIME)
+                ), 0) = 0
+                THEN ctb.STAKEHOLDER_ANSWER_TIME
+                ELSE DATE_SUB(
+                    ctb.CREATED_DATE,
+                    INTERVAL (
+                        SELECT COUNT(*)
+                        FROM meta_data.calendar
+                        WHERE holiday = 1
+                          AND calendar_date BETWEEN DATE(ctb.STAKEHOLDER_ANSWER_TIME) AND DATE(ctb.CREATED_DATE)
+                    ) DAY
+                )
+            END AS STAKEHOLDER_ANSWER_TIME,
+
+            CASE
+                WHEN COALESCE((
+                    SELECT COUNT(*)
+                    FROM meta_data.calendar
+                    WHERE holiday = 1
+                      AND calendar_date BETWEEN DATE(ctb.CREATED_DATE) AND DATE(ctb.COMPLETE)
+                ), 0) = 0
+                THEN ctb.COMPLETE
+                ELSE DATE_SUB(
+                    ctb.CREATED_DATE,
+                    INTERVAL (
+                        SELECT COUNT(*)
+                        FROM meta_data.calendar
+                        WHERE holiday = 1
+                          AND calendar_date BETWEEN DATE(ctb.COMPLETE) AND DATE(ctb.CREATED_DATE)
+                    ) DAY
+                )
+            END AS COMPLETE,
+
+            CASE
+                WHEN COALESCE((
+                    SELECT COUNT(*)
+                    FROM meta_data.calendar
+                    WHERE holiday = 1
+                      AND calendar_date BETWEEN DATE(ctb.CREATED_DATE) AND DATE(ctb.STAKEHOLDER_ANSWER_TO_COMPLETE)
+                ), 0) = 0
+                THEN ctb.STAKEHOLDER_ANSWER_TO_COMPLETE
+                ELSE DATE_SUB(
+                    ctb.CREATED_DATE,
+                    INTERVAL (
+                        SELECT COUNT(*)
+                        FROM meta_data.calendar
+                        WHERE holiday = 1
+                          AND calendar_date BETWEEN DATE(ctb.STAKEHOLDER_ANSWER_TO_COMPLETE) AND DATE(ctb.CREATED_DATE)
+                    ) DAY
+                )
+            END AS STAKEHOLDER_ANSWER_TO_COMPLETE,
+
+            CASE
+                WHEN COALESCE((
+                    SELECT COUNT(*)
+                    FROM meta_data.calendar
+                    WHERE holiday = 1
+                      AND calendar_date BETWEEN DATE(ctb.CREATED_DATE) AND DATE(ctb.WAIT_TO_EXECUTE)
+                ), 0) = 0
+                THEN ctb.WAIT_TO_EXECUTE
+                ELSE DATE_SUB(
+                    ctb.CREATED_DATE,
+                    INTERVAL (
+                        SELECT COUNT(*)
+                        FROM meta_data.calendar
+                        WHERE holiday = 1
+                          AND calendar_date BETWEEN DATE(ctb.WAIT_TO_EXECUTE) AND DATE(ctb.CREATED_DATE)
+                    ) DAY
+                )
+            END AS WAIT_TO_EXECUTE,
+
+            CASE
+                WHEN COALESCE((
+                    SELECT COUNT(*)
+                    FROM meta_data.calendar
+                    WHERE holiday = 1
+                      AND calendar_date BETWEEN DATE(ctb.CREATED_DATE) AND DATE(ctb.RESP_CHANGE)
+                ), 0) = 0
+                THEN ctb.RESP_CHANGE
+                ELSE DATE_SUB(
+                    ctb.CREATED_DATE,
+                    INTERVAL (
+                        SELECT COUNT(*)
+                        FROM meta_data.calendar
+                        WHERE holiday = 1
+                          AND calendar_date BETWEEN DATE(ctb.RESP_CHANGE) AND DATE(ctb.CREATED_DATE)
+                    ) DAY
+                )
+            END AS RESP_CHANGE
+        FROM COMPLETE_TIME_BASE ctb
+    )
+
+    SELECT
+        crt.TASK_ID,
+        crt.CREATED_DATE,
+        crt.YEARMONTH,
+        crt.STAKEHOLDER_ANSWER_TIME,
+        crt.COMPLETE,
+        crt.STAKEHOLDER_ANSWER_TO_COMPLETE,
+        crt.WAIT_TO_EXECUTE,
+        crt.RESP_CHANGE,
+
+        CASE
+            WHEN crt.STAKEHOLDER_ANSWER_TIME IS NOT NULL
+                 AND crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NOT NULL
+                 AND crt.COMPLETE IS NOT NULL
+                 AND crt.RESP_CHANGE IS NOT NULL
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, crt.STAKEHOLDER_ANSWER_TIME)
+                 - (DATEDIFF(crt.STAKEHOLDER_ANSWER_TIME, crt.CREATED_DATE) * 900)
+
+            WHEN crt.STAKEHOLDER_ANSWER_TIME IS NULL
+                 AND crt.COMPLETE IS NOT NULL
+                 AND crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NULL
+                 AND crt.RESP_CHANGE IS NULL
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, crt.COMPLETE)
+                 - (DATEDIFF(crt.COMPLETE, crt.CREATED_DATE) * 900)
+
+            WHEN crt.STAKEHOLDER_ANSWER_TIME IS NOT NULL
+                 AND crt.COMPLETE IS NOT NULL
+                 AND crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NULL
+                 AND crt.RESP_CHANGE IS NULL
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, crt.STAKEHOLDER_ANSWER_TIME)
+                 - (DATEDIFF(crt.STAKEHOLDER_ANSWER_TIME, crt.CREATED_DATE) * 900)
+
+            WHEN crt.STAKEHOLDER_ANSWER_TIME IS NULL
+                 AND crt.COMPLETE IS NOT NULL
+                 AND crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NULL
+                 AND crt.RESP_CHANGE IS NOT NULL
+                 AND crt.RESP_CHANGE <= crt.COMPLETE
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, crt.RESP_CHANGE)
+                 - (DATEDIFF(crt.RESP_CHANGE, crt.CREATED_DATE) * 900)
+
+            WHEN crt.STAKEHOLDER_ANSWER_TIME IS NULL
+                 AND crt.COMPLETE IS NOT NULL
+                 AND crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NULL
+                 AND crt.RESP_CHANGE IS NOT NULL
+                 AND crt.RESP_CHANGE > crt.COMPLETE
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, crt.COMPLETE)
+                 - (DATEDIFF(crt.COMPLETE, crt.CREATED_DATE) * 900)
+
+            WHEN crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NULL
+                 AND crt.STAKEHOLDER_ANSWER_TIME IS NULL
+                 AND crt.COMPLETE IS NULL
+                 AND crt.RESP_CHANGE IS NOT NULL
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, crt.RESP_CHANGE)
+                 - (DATEDIFF(crt.RESP_CHANGE, crt.CREATED_DATE) * 900)
+
+            WHEN crt.STAKEHOLDER_ANSWER_TIME IS NOT NULL
+                 AND crt.COMPLETE IS NULL
+                 AND crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NULL
+                 AND crt.RESP_CHANGE IS NULL
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, crt.STAKEHOLDER_ANSWER_TIME)
+                 - (DATEDIFF(crt.STAKEHOLDER_ANSWER_TIME, crt.CREATED_DATE) * 900)
+
+            WHEN crt.STAKEHOLDER_ANSWER_TIME IS NULL
+                 AND crt.COMPLETE IS NULL
+                 AND crt.STAKEHOLDER_ANSWER_TO_COMPLETE IS NULL
+                 AND crt.RESP_CHANGE IS NULL
+            THEN TIMESTAMPDIFF(MINUTE, crt.CREATED_DATE, NOW())
+                 - (DATEDIFF(NOW(), crt.CREATED_DATE) * 900)
+        END AS EXECUTION_TIME
+    FROM COMPLETE_RIGHT_TIME crt
+)
+
+SELECT
+    TIME.tID AS 'ID тикета',
+    TIME.YEARMONTH AS 'YEARMONTH',
+    TIME.LAST_NAME AS 'Фамилия',
+    CASE
+        WHEN TIME.TIME_TO_EXECUTION < 9 THEN 7
+        WHEN TIME.TIME_TO_EXECUTION > 22 THEN 22
+        ELSE TIME.TIME_TO_EXECUTION
+    END AS 'Время до взятия в работу (минуты)',
+    CASE
+        WHEN TIMESTAMPDIFF(MINUTE, TIME.EXECUTION_DATE, bfm.POST_DATE)
+             - (DATEDIFF(bfm.POST_DATE, TIME.EXECUTION_DATE) * 900) < 15 THEN 15
+        WHEN TIMESTAMPDIFF(MINUTE, TIME.EXECUTION_DATE, bfm.POST_DATE)
+             - (DATEDIFF(bfm.POST_DATE, TIME.EXECUTION_DATE) * 900) > 45 THEN 45
+        ELSE TIMESTAMPDIFF(MINUTE, TIME.EXECUTION_DATE, bfm.POST_DATE)
+             - (DATEDIFF(bfm.POST_DATE, TIME.EXECUTION_DATE) * 900)
+    END AS 'Время до первой активности в тикете (минуты)',
+    CASE
+        WHEN COMPLETE_TIME.EXECUTION_TIME < 240 THEN 240
+        WHEN COMPLETE_TIME.EXECUTION_TIME > 720 THEN 720
+        ELSE COMPLETE_TIME.EXECUTION_TIME
+    END AS 'Общее время решения (минуты)',
+    CASE
+        WHEN utt.UF_TD_CATEGORY = 1774 THEN 'Новые решения: подбор решения клиента'
+        WHEN utt.UF_TD_CATEGORY = 1772 THEN 'Мониторинг: удаленная настройка/вывести на связь'
+        WHEN utt.UF_TD_CATEGORY = 1776 THEN 'ТРК: подбор решения клиента'
+        WHEN utt.UF_TD_CATEGORY = 1768 THEN 'Видео: подбор решения клиента'
+        WHEN utt.UF_TD_CATEGORY = 1769 THEN 'Видео: удаленная настройка'
+        WHEN utt.UF_TD_CATEGORY = 1775 THEN 'Тахография (решение проблемы)'
+        WHEN utt.UF_TD_CATEGORY = 1771 THEN 'Мониторинг: подбор решения клиента'
+        WHEN utt.UF_TD_CATEGORY = 1770 THEN 'Закупка'
+        WHEN utt.UF_TD_CATEGORY = 1773 THEN 'Некачественный тикет'
+        ELSE GROUP_CONCAT(DISTINCT task_label.NAME SEPARATOR ', ')
+    END AS 'Тег',
+    CASE
+        WHEN tasks.CLOSED_DATE IS NULL THEN TIMESTAMPDIFF(MINUTE, tasks.CREATED_DATE, NOW())
+        ELSE TIMESTAMPDIFF(MINUTE, tasks.CREATED_DATE, tasks.CLOSED_DATE)
+    END AS 'Время реального выполнения',
+    CONCAT('https://portal.stavtrack.ru/company/personal/user/3740/tasks/task/view/', TIME.tID, '/') AS 'Ссылка на тикет',
+    CONCAT(
+        '<a href="',
+        'https://portal.stavtrack.ru/company/personal/user/3740/tasks/task/view/',
+        TIME.tID,
+        '/"target="_blank">',
+        TIME.tID,
+        '</a'
+    ) AS 'Ссылка для супер сета'
+FROM TIME
+INNER JOIN COMPLETE_TIME ON TIME.tID = COMPLETE_TIME.TASK_ID
+LEFT JOIN (
+    SELECT *
+    FROM (
+        SELECT
+            bfm.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY SUBSTRING_INDEX(bfm.XML_ID, '_', -1)
+                ORDER BY bfm.POST_DATE
+            ) AS rn
+        FROM raw_data.b_forum_message bfm
+        WHERE bfm.AUTHOR_ID IN (SELECT ID FROM engineers)
+    ) t
+    WHERE rn = 2
+) bfm ON TIME.tID = SUBSTRING_INDEX(bfm.XML_ID, '_', -1)
+LEFT JOIN raw_data.b_uts_tasks_task utt ON TIME.tID = utt.VALUE_ID
+LEFT JOIN raw_data.b_tasks_label task_label ON utt.UF_TD_CATEGORY = task_label.ID
+INNER JOIN raw_data.b_tasks tasks ON TIME.tID = tasks.ID
+GROUP BY TIME.tID
